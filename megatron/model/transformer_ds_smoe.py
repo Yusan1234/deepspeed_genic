@@ -202,7 +202,7 @@ class ParallelExpert(MegatronModule):
             bias=self.add_bias,
             gather_output=False,
             skip_bias_add=True,
-            moe=moe,
+            moe=False,
             enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
         )
 
@@ -268,31 +268,53 @@ class NoisyTopkRouter(MegatronModule):
         return router_output, indices
 
 class DeepSets(MegatronModule):
-    def __init__(self, dim_input, dim_hidden, dim_output):
+    def __init__(self, config):
         super(DeepSets, self).__init__()
-        self.dim_input = dim_input
-        self.dim_hidden = dim_hidden
-        self.dim_output = dim_output
+        self.dim_input = config.deepset_input
+        self.dim_hidden = config.deepset_hidden
+        self.dim_output = config.deepset_output
+        self.mlp = tensor_parallel.ColumnParallelLinear(
+                self.dim_hidden,
+                self.dim_output,
+                config=config,
+                init_method=config.init_method,
+                bias=config.add_bias_linear,
+                gather_output=False)
+        self.mlp_hidden = tensor_parallel.ColumnParallelLinear(
+                self.dim_hidden,
+                self.dim_hidden,
+                config=config,
+                init_method=config.init_method,
+                bias=config.add_bias_linear,
+                gather_output=False)
+        self.mlp_rho = tensor_parallel.ColumnParallelLinear(
+                self.dim_hidden+1,
+                self.dim_hidden,
+                config=config,
+                init_method=config.init_method,
+                bias=config.add_bias_linear,
+                gather_output=False)
+        self.mlp_out = tensor_parallel.RowParallelLinear(
+            self.dim_hidden,
+            self.dim_output,
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=config.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True)
+        def relu_f(x): return F.relu(x)
+        self.activation_func = relu_f
+        
 
-        self.phi = torch.nn.Sequential(
-            torch.nn.Linear(dim_input, dim_hidden),
-            torch.nn.ReLU(),
-            torch.nn.Linear(dim_hidden, dim_hidden),
-            torch.nn.ReLU(),
-            torch.nn.Linear(dim_hidden, dim_hidden)
-        )
-
-        self.rho = torch.nn.Sequential(
-            torch.nn.Linear(dim_hidden + 1, dim_hidden),
-            torch.nn.ReLU(),
-            torch.nn.Linear(dim_hidden, dim_hidden),
-            torch.nn.ReLU(),
-            torch.nn.Linear(dim_hidden, dim_output)
-        )
 
     def forward(self, expert_outputs, gating_scores):
         # エキスパートの出力にDeepSetsを適用
-        x = self.phi(expert_outputs)
+        x = self.mlp(expert_outputs)
+        x = self.activation_func(x)
+        x = self.mlp_hidden(x)
+        x = self.activation_func(x)
+        x = self.mlp_hidden(x)
+        
         x = torch.sum(x, dim=0, keepdim=True)
 
         # ゲーティングスコアの次元を調整
@@ -302,7 +324,12 @@ class DeepSets(MegatronModule):
         x = torch.cat([x, gating_scores], dim=-1)
 
         # 最終出力を得る
-        x = self.rho(x)
+        x = self.mlp_rho(x)
+        x = self.activation_func(x)
+        x = self.mlp_hidden(x)
+        x = self.activation_func(x)
+        x = self.mlp_out(x)
+        
         return x
     
     
@@ -323,7 +350,7 @@ class SparseMoE(MegatronModule):
         s = hidden_states.size(0)
         b = hidden_states.size(1)
         h = hidden_states.size(2)
-        route, indices = self.router(hidden_states) ## TODO I/O Check
+        route, indices = self.router(hidden_states) ## TODO: I/O Check
         max_prob, max_ind = torch.max(route, dim=2)
         max_prob = torch.unsqueeze(max_prob, 2) # [s b 1]
 
@@ -334,24 +361,31 @@ class SparseMoE(MegatronModule):
         max_prob = max_prob.view(-1, max_prob.size(2)) # [s*b 1]
         max_ind = max_ind.view(-1) # [s*b]
 
-        output_total = torch.empty_like(hidden_states)
-        output_bias_total = torch.empty_like(hidden_states)
-        #TODO (rprenger) This does each expert in serial, but it could be parallelized
+        # エキスパートの出力と確率値を保持するリスト
+        expert_outputs = []
+        gating_scores = []
 
-        for expert_num, expert in enumerate(self.experts):
-            local_indices = (max_ind == expert_num).nonzero()
-            hidden = hidden_states[local_indices,:]
-            output, output_bias = expert(hidden)
-            output_bias = output_bias.expand_as(output)
-            output_total[local_indices,:] = output
-            output_bias_total[local_indices,:] = output_bias
+        # 各エキスパートの出力と対応する確率値を別々のリストに追加
+        for i, expert in enumerate(self.experts):
+            expert_mask = (indices == i).any(dim=-1)
+            expert_mask = expert_mask.view(x.shape[0], -1)  # サイズ調整
 
-        output_total = output_total*max_prob
-        output_bias_total = output_bias_total*max_prob
-        output_total = output_total.view(s, b, h)
-        output_bias_total = output_bias_total.view(s, b, h)
+            if expert_mask.any():
+                expert_input = hidden_states[expert_mask]  # インデックス修正
+                expert_output = expert(expert_input)
+                gating_score = route[expert_mask[:, i]].unsqueeze(-1)
 
-        return output_total, output_bias_total
+                expert_outputs.append(expert_output)
+                gating_scores.append(gating_score)
+
+        # エキスパートの出力と確率値を結合
+        expert_outputs = torch.cat(expert_outputs, dim=0)
+        gating_scores = torch.cat(gating_scores, dim=0)
+
+        # DeepSetsを適用して最終出力を得る
+        final_output = self.deepsets(expert_outputs, gating_scores)
+
+        return final_output
 
 
 class SwitchMLP(MegatronModule):
@@ -1128,7 +1162,8 @@ class ParallelTransformerLayer(MegatronModule):
         # MLP
         self.num_experts = num_experts
         if args.num_experts_switch is not None:
-            self.mlp = SwitchMLP(config) # Megatron-LM's MoE
+            # self.mlp = SwitchMLP(config) # Megatron-LM's MoE
+            self.mlp = SparseMoE(config)
         else:
             if self.num_experts <= 1: # dense, not MoE
                 self.mlp = ParallelMLP(config)
