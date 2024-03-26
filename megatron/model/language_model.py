@@ -12,7 +12,7 @@ from megatron.core.enums import ModelType
 from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
 from .rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
-from .transformer import ParallelTransformer
+from .transformer_ds_smoe import ParallelTransformer
 from .utils import get_linear_layer
 from .utils import init_method_normal, scaled_init_method_normal, gather_and_init
 

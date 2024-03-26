@@ -11,6 +11,7 @@ else:
 from .distributed import DistributedDataParallel
 from .bert_model import BertModel
 from .gpt_model import GPTModel, GPTModelPipe
+from .gpt_model_sannai import GPTModelSannai, GPTModelPipeSannai
 from .t5_model import T5Model
 from .language_model import get_language_model
 from .module import Float16Module
